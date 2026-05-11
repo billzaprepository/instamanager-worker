@@ -24,7 +24,7 @@ async function processPublishJob(job: Job<PublishJobData>) {
     FROM scheduled_posts sp
     JOIN media_files mf ON mf.id = sp.media_id
     JOIN instagram_accounts ia ON ia.id = sp.ig_account_id
-    WHERE sp.id = $1 AND sp.tenant_id = $2
+    WHERE sp.id = $1 AND (sp.tenant_id = $2 OR sp.tenant_id IS NULL)
   `, [postId, tenantId])
 
   const post = rows[0]
