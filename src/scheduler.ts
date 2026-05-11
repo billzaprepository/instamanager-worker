@@ -1,74 +1,121 @@
-import { scheduleQueue, publishQueue } from './queues'
-import { query } from './db'
-import { refreshToken } from './instagram'
-import { execute } from './db'
+import { Worker, Job } from 'bullmq'
+import { redisConnection, publishQueue } from '../queues'
+import { query, execute } from '../db'
 
-// Roda a cada minuto — verifica horários e enfileira jobs
-export async function runScheduler() {
-  const now           = new Date()
-  const hour          = ((now.getUTCHours() - 3) % 24 + 24) % 24
-  const todayStr      = now.toISOString().slice(0, 10)
-  const brDate        = new Date(now.getTime() - 3 * 60 * 60 * 1000)
-  const todayWeekday  = brDate.getUTCDay()
-  const todayMonthday = brDate.getUTCDate()
-
-  // Enfileira job de schedule
-  await scheduleQueue.add('check-schedules', {
-    hour, todayStr, todayWeekday, todayMonthday,
-  }, {
-    jobId:              `schedule-${todayStr}-${hour}-${now.getMinutes()}`,
-    removeOnComplete:   true,
-  })
-
-  // Busca posts aprovados ainda não enfileirados
-  const approved = await query(`
-    SELECT sp.id, sp.tenant_id, sp.ig_account_id
-    FROM scheduled_posts sp
-    WHERE sp.status = 'approved'
-      AND (
-        sp.publish_mode = 'immediate'
-        OR (sp.publish_mode = 'scheduled' AND sp.scheduled_at <= now())
-      )
-    LIMIT 100
-  `)
-
-  for (const post of approved) {
-    const jobId = `post-${post.id}`
-    const existing = await publishQueue.getJob(jobId)
-    if (existing) continue
-
-    await publishQueue.add('publish-post', {
-      postId:    post.id,
-      tenantId:  post.tenant_id,
-      accountId: post.ig_account_id,
-    }, { jobId })
-  }
-
-  if (approved.length > 0) {
-    console.log(`[scheduler] enqueued ${approved.length} approved posts`)
-  }
+export interface ScheduleJobData {
+  hour:          number
+  todayStr:      string
+  todayWeekday:  number
+  todayMonthday: number
 }
 
-// Renova tokens próximos de expirar (roda 1x/hora)
-export async function refreshExpiringTokens() {
-  const accounts = await query(`
-    SELECT id, ig_username, long_lived_token
-    FROM instagram_accounts
-    WHERE is_active = true
-      AND token_expires_at < now() + INTERVAL '15 days'
-  `)
+async function processScheduleJob(job: Job<ScheduleJobData>) {
+  const { hour, todayStr, todayWeekday, todayMonthday } = job.data
 
-  for (const acc of accounts) {
-    const data = await refreshToken(acc.long_lived_token)
-    if (data?.access_token) {
+  console.log(`[schedule-worker] hour ${hour} weekday ${todayWeekday} monthday ${todayMonthday}`)
+
+  const schedules = await query(`SELECT * FROM schedules WHERE is_active = true`)
+  console.log(`[schedule-worker] found ${schedules.length} active schedules`)
+
+  let created = 0
+
+  for (const schedule of schedules) {
+    try {
+      // Verifica hora
+      if (!schedule.hours?.includes(hour)) continue
+
+      // Verifica dia da semana
+      if (schedule.weekdays?.length > 0 && !schedule.weekdays.includes(todayWeekday)) continue
+
+      // Verifica dia do mês
+      if (schedule.monthdays?.length > 0 && !schedule.monthdays.includes(todayMonthday)) continue
+
+      // Verifica se já executou hoje nessa hora (usa data de Brasília)
+      const executions = await query(`
+        SELECT id FROM schedule_executions
+        WHERE schedule_id = $1
+          AND hour = $2
+          AND executed_at >= ($3::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date
+      `, [schedule.id, hour, todayStr + 'T00:00:00-03:00'])
+
+      if (executions.length > 0) {
+        console.log(`[schedule-worker] schedule "${schedule.name}" already executed at hour ${hour}`)
+        continue
+      }
+
+      // Busca mídias
+      const media = await query(`
+        SELECT media_id FROM schedule_media
+        WHERE schedule_id = $1 ORDER BY position ASC
+      `, [schedule.id])
+
+      if (!media.length) {
+        console.log(`[schedule-worker] schedule "${schedule.name}" has no media`)
+        continue
+      }
+
+      const idx     = (schedule.current_index || 0) % media.length
+      const mediaId = media[idx].media_id
+
+      // Cria posts para cada conta
+      for (const accountId of (schedule.ig_account_ids || [])) {
+        const rows = await query(`
+          INSERT INTO scheduled_posts
+            (media_id, ig_account_id, tenant_id, post_type, caption, hashtags,
+             cover_url, story_link, publish_mode, status)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'immediate', 'approved')
+          RETURNING id
+        `, [
+          mediaId, accountId, schedule.tenant_id,
+          schedule.post_type, schedule.caption || '',
+          schedule.hashtags || '', schedule.cover_url || null,
+          schedule.story_link || null,
+        ])
+
+        const postId = rows[0]?.id
+        if (postId) {
+          await publishQueue.add('publish-post', {
+            postId,
+            tenantId:  schedule.tenant_id,
+            accountId,
+          }, { jobId: `post-${postId}` })
+          created++
+          console.log(`[schedule-worker] enqueued post ${postId} for @${accountId}`)
+        }
+      }
+
+      // Registra execução
       await execute(`
-        UPDATE instagram_accounts
-        SET long_lived_token = $1, access_token = $1,
-            token_expires_at = now() + ($2 * INTERVAL '1 second'),
-            last_token_refresh = now()
-        WHERE id = $3
-      `, [data.access_token, data.expires_in || 5183944, acc.id])
-      console.log(`[scheduler] token renovado: @${acc.ig_username}`)
+        INSERT INTO schedule_executions (schedule_id, hour, status)
+        VALUES ($1, $2, 'created')
+      `, [schedule.id, hour])
+
+      // Avança índice
+      await execute(`
+        UPDATE schedules SET current_index = $1 WHERE id = $2
+      `, [(idx + 1) % media.length, schedule.id])
+
+      console.log(`[schedule-worker] ✅ schedule "${schedule.name}" hour ${hour}: ${schedule.ig_account_ids?.length} posts enqueued`)
+
+    } catch (err: any) {
+      console.error(`[schedule-worker] error on schedule ${schedule.id}:`, err.message)
     }
   }
+
+  console.log(`[schedule-worker] hour ${hour}: ${created} total jobs enqueued`)
+  return { created }
+}
+
+export function startScheduleWorker() {
+  const worker = new Worker<ScheduleJobData>('schedule', processScheduleJob, {
+    connection:  redisConnection,
+    concurrency: 1,
+  })
+
+  worker.on('completed', job => console.log(`[schedule-worker] ✅ job ${job.id} done`))
+  worker.on('failed',    (job, err) => console.error(`[schedule-worker] ❌ job ${job?.id}:`, err.message))
+  worker.on('error',     err => console.error('[schedule-worker] error:', err))
+
+  console.log('[schedule-worker] started')
+  return worker
 }
