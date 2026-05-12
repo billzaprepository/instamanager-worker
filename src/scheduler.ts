@@ -24,7 +24,7 @@ export async function runScheduler() {
   const approved = await query(`
     SELECT sp.id, sp.tenant_id, sp.ig_account_id
     FROM scheduled_posts sp
-    WHERE sp.status = 'approved'
+    WHERE (sp.status = 'approved' OR (sp.status = 'draft' AND sp.publish_mode = 'scheduled'))
       AND (
         sp.publish_mode = 'immediate'
         OR (sp.publish_mode = 'scheduled' AND sp.scheduled_at <= now())
